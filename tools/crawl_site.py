@@ -17,6 +17,7 @@ Usage:
   python3 crawl_site.py https://example.com/page/ --single   # one page + its links/images
 """
 import argparse
+import gzip
 import os
 import ipaddress
 import json
@@ -144,6 +145,7 @@ class Crawler:
         self.single = single
         self.allow_private = allow_private
         self.delay = delay
+        self.base_delay = delay
         self.workers = workers
         self.deadline = time.time() + max_minutes * 60
         self.check_external = check_external
@@ -161,6 +163,7 @@ class Crawler:
         self.external = {}        # ext url -> record
         self.ext_sources = defaultdict(set)
         self.sitemap_urls = []
+        self.child_sitemaps = set()
         self.sitemaps = []
         self.robots = None
         self.robots_txt = ""
@@ -183,6 +186,44 @@ class Crawler:
     def time_left(self):
         return time.time() < self.deadline
 
+    def _throttle(self):
+        with self.lock:
+            self.err_events = getattr(self, "err_events", 0) + 1
+            self.delay = min(max(self.delay * 1.6, 0.6), 2.0)
+            self.ok_streak = 0
+
+    def _ok(self):
+        with self.lock:
+            self.ok_streak = getattr(self, "ok_streak", 0) + 1
+            if self.ok_streak >= 80 and self.delay > self.base_delay:
+                self.delay = max(self.base_delay, self.delay * 0.75)
+                self.ok_streak = 0
+
+    def _request(self, method, url, stream):
+        """GET/HEAD with retries. Slows the whole crawl down when the server throttles or drops connections,
+        so overload is not misreported as broken pages."""
+        last = None
+        for attempt in range(4):
+            time.sleep(self.delay)
+            try:
+                r = self.session().request(method, url, allow_redirects=False, timeout=self.timeout, stream=stream)
+            except requests.exceptions.SSLError:
+                raise
+            except requests.exceptions.RequestException as e:
+                last = e
+                self._throttle()
+                time.sleep((2, 5, 10, 10)[attempt])          # back off: 2s, 5s, 10s
+                continue
+            if r.status_code in (429, 503, 502, 504) and attempt < 3:
+                ra = r.headers.get("Retry-After", "")
+                r.close()
+                self._throttle()
+                time.sleep(min(int(ra) if ra.isdigit() else 5 * (attempt + 1), 60))
+                continue
+            self._ok()
+            return r
+        raise last or requests.exceptions.ConnectionError("no response")
+
     def fetch(self, url, method="GET", want_body=True, max_hops=10):
         """Follow redirects manually so every hop is recorded."""
         chain, cur, t0 = [], url, time.time()
@@ -194,18 +235,15 @@ class Crawler:
                 rec["error"] = "blocked: private/local address"
                 break
             try:
-                time.sleep(self.delay)
-                r = self.session().request(method, cur, allow_redirects=False, timeout=self.timeout,
-                                           stream=not want_body)
+                r = self._request(method, cur, not want_body)
             except requests.exceptions.SSLError as e:
                 rec["error"] = f"SSL error: {str(e)[:160]}"
                 break
-            except requests.exceptions.Timeout:
-                rec["error"] = f"timeout after {self.timeout}s"
-                break
             except requests.exceptions.RequestException as e:
-                rec["error"] = f"connection error: {str(e)[:160]}"
+                rec["error"] = f"unreachable (no response after 4 tries): {str(e)[:120]}"
+                rec["unreachable"] = True
                 break
+            rec["server_ms"] = rec.get("server_ms", 0) + int(r.elapsed.total_seconds() * 1000)
             if rec["status"] is None:
                 rec["status"] = r.status_code
             if r.status_code in (301, 302, 303, 307, 308) and r.headers.get("Location"):
@@ -234,7 +272,7 @@ class Crawler:
         else:
             rec["error"] = f"more than {max_hops} redirects"
         rec["chain"] = chain
-        rec["elapsed_ms"] = int((time.time() - t0) * 1000)
+        rec["elapsed_ms"] = rec.pop("server_ms", None)  # real server time only (no retry/back-off waits)
         if rec["final_status"] is None and rec["status"] is not None and not chain:
             rec["final_status"] = rec["status"]
         return rec
@@ -309,22 +347,43 @@ class Crawler:
             except requests.exceptions.RequestException as e:
                 self.sitemaps.append({"url": sm, "status": None, "type": "error", "count": 0, "error": str(e)[:120]})
                 continue
-            if r.status_code != 200 or b"<" not in r.content[:500]:
-                if sm in [norm_url(d) for d in declared]:
-                    self.sitemaps.append({"url": sm, "status": r.status_code, "type": "missing", "count": 0, "error": ""})
+            is_declared = sm in [norm_url(d) for d in declared] or sm in self.child_sitemaps
+            raw = r.content
+            if raw[:2] == b"\x1f\x8b":
+                try:
+                    raw = gzip.decompress(raw)
+                except OSError:
+                    pass
+            body = raw.lstrip(b"\xef\xbb\xbf \t\r\n")
+            looks_html = body[:300].lower().startswith((b"<!doctype html", b"<html")) or \
+                "html" in (r.headers.get("Content-Type") or "").lower()
+            if r.status_code != 200 or looks_html or b"<" not in body[:500]:
+                if is_declared:   # only report sitemaps the site actually declares/links
+                    why = "returns an HTML page, not XML" if looks_html else f"HTTP {r.status_code}"
+                    self.sitemaps.append({"url": sm, "status": r.status_code, "type": "not a sitemap", "count": 0, "error": why})
                 continue
+            warn = "leading whitespace/BOM before XML declaration" if body != raw.lstrip(b"\xef\xbb\xbf") or raw[:1] in (b" ", b"\n", b"\r", b"\t") else ""
             try:
-                root = ET.fromstring(r.content)
+                root = ET.fromstring(body)
             except ET.ParseError as e:
-                self.sitemaps.append({"url": sm, "status": 200, "type": "invalid XML", "count": 0, "error": str(e)[:120]})
+                locs = [m.decode("utf-8", "ignore").strip() for m in re.findall(rb"<loc>\s*([^<]+?)\s*</loc>", body)]
+                kind = "sitemapindex" if b"<sitemapindex" in body[:2000] else "urlset"
+                self.sitemaps.append({"url": sm, "status": 200, "type": f"invalid XML ({kind})", "count": len(locs),
+                                      "error": str(e)[:120]})
+                if kind == "sitemapindex":
+                    self.child_sitemaps.update(norm_url(x) for x in locs)
+                    queue.extend(locs)
+                else:
+                    urls.extend((norm_url(x), sm) for x in locs if norm_url(x))
                 continue
             tag = root.tag.split("}")[-1]
             locs = [el.text.strip() for el in root.iter() if el.tag.split("}")[-1] == "loc" and el.text]
             if tag == "sitemapindex":
-                self.sitemaps.append({"url": sm, "status": 200, "type": "index", "count": len(locs), "error": ""})
+                self.sitemaps.append({"url": sm, "status": 200, "type": "index", "count": len(locs), "error": warn})
+                self.child_sitemaps.update(norm_url(x) for x in locs)
                 queue.extend(locs)
             else:
-                self.sitemaps.append({"url": sm, "status": 200, "type": "urlset", "count": len(locs), "error": ""})
+                self.sitemaps.append({"url": sm, "status": 200, "type": "urlset", "count": len(locs), "error": warn})
                 for loc in locs:
                     u = norm_url(loc)
                     if u:
@@ -460,6 +519,9 @@ class Crawler:
             "cache_control": rec["headers"].get("cache-control"),
         }
         page["page_type"] = classify(page)
+        if url == self.start or not getattr(self, "platform", None):
+            if url == self.start or not hasattr(self, "platform"):
+                self.platform = detect_platform(rec["body"], rec["headers"])
         return page
 
     # -- main loop
@@ -520,6 +582,7 @@ class Crawler:
             self.notes.append(f"Page limit reached ({self.max_pages} HTML pages). "
                               f"{len(queue)} more URLs were discovered but not crawled.")
         self.status_check_remaining()
+        self.retry_unreachable()
         self.check_images()
         self.check_externals()
 
@@ -527,13 +590,33 @@ class Crawler:
         """Status-check internal link targets + sitemap URLs not crawled (no parsing)."""
         targets = [u for u in list(self.inlinks) + [s["url"] for s in self.sitemap_urls]
                    if u not in self.status and not SKIP_EXT.search(urlparse(u).path)]
-        targets = list(dict.fromkeys(targets))[:4000]
+        targets = list(dict.fromkeys(targets))[:20000]
         with ThreadPoolExecutor(self.workers) as pool:
             for u, rec in zip(targets, pool.map(lambda x: self.fetch(x, want_body=False), targets)):
                 if not self.time_left():
                     break
                 rec.pop("body", None)
                 self.status[u] = rec
+
+    def retry_unreachable(self):
+        """Second, slow, single-threaded pass over URLs that gave no response, so server overload
+        during the fast crawl is not reported as broken pages."""
+        todo = [u for u, s in self.status.items() if s.get("unreachable")][:400]
+        if not todo:
+            return
+        self.delay = max(self.delay, 1.5)
+        fixed = 0
+        for u in todo:
+            if not self.time_left():
+                break
+            rec = self.fetch(u, want_body=False)
+            rec.pop("body", None)
+            if not rec.get("unreachable"):
+                self.status[u] = rec
+                fixed += 1
+        left = sum(1 for s in self.status.values() if s.get("unreachable"))
+        self.notes.append(f"Server throttled/dropped connections during the crawl; slow re-check recovered {fixed} URLs, "
+                          f"{left} still gave no response (listed as 'not confirmed', not as broken).")
 
     def check_images(self):
         imgs = list(self.image_pages)[: self.max_images]
@@ -608,8 +691,10 @@ class Crawler:
         return {
             "meta": {"start_url": self.start, "domain": self.root_host, "crawled_at": now_iso(),
                      "mode": "single page" if self.single else "site crawl",
+                     "platform": getattr(self, "platform", {"family": "custom", "label": "Unknown", "server": ""}),
                      "max_pages": self.max_pages, "pages_parsed": len(self.pages),
                      "urls_status_checked": len(self.status), "images_found": len(self.image_pages),
+                     "unreachable": sum(1 for x in self.status.values() if x.get("unreachable")),
                      "images_checked": len(self.images), "external_links": len(self.ext_sources),
                      "notes": self.notes, "user_agent": UA},
             "site_checks": self.site_checks,
@@ -627,6 +712,54 @@ class Crawler:
             "external_links": [{"url": u, **self.external.get(u, {}), "pages": sorted(self.ext_sources[u])[:20],
                                 "page_count": len(self.ext_sources[u])} for u in self.ext_sources],
         }
+
+
+# ----------------------------------------------------------------------------- platform
+def detect_platform(html, headers):
+    """Best-effort CMS / framework detection so fixes can say exactly where to change things."""
+    h = (html or "")[:400000].lower()
+    gen = re.search(r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)', html[:80000] if html else "", re.I)
+    g = gen.group(1).lower() if gen else ""
+    extras = []
+    if "wordpress" in g or "/wp-content/" in h or "/wp-includes/" in h:
+        fam = "wordpress"
+        for marker, name in (("elementor", "Elementor"), ("rank-math", "Rank Math"), ("rankmath", "Rank Math"),
+                             ("yoast", "Yoast SEO"), ("woocommerce", "WooCommerce"), ("divi", "Divi"),
+                             ("astra", "Astra"), ("wp-rocket", "WP Rocket"), ("litespeed", "LiteSpeed Cache"),
+                             ("gutenberg", "Gutenberg"), ("wpbakery", "WPBakery"), ("bricks", "Bricks")):
+            if marker in h and name not in extras:
+                extras.append(name)
+    elif "cdn.shopify.com" in h or "shopify" in g:
+        fam = "shopify"
+    elif "__next_data__" in h or "/_next/static" in h or "next.js" in g:
+        fam = "nextjs"
+    elif "__nuxt" in h or "/_nuxt/" in h:
+        fam = "nuxt"
+    elif "wixstatic.com" in h or "wix.com" in g:
+        fam = "wix"
+    elif "data-wf-page" in h or "webflow" in g:
+        fam = "webflow"
+    elif "squarespace" in h:
+        fam = "squarespace"
+    elif "___gatsby" in h:
+        fam = "gatsby"
+    elif "ng-version" in h:
+        fam = "angular"
+    elif re.search(r'<div id="(root|app)"></div>', h) or "data-reactroot" in h or "/static/js/main." in h:
+        fam = "react"
+    elif "joomla" in g:
+        fam = "joomla"
+    elif "drupal" in g or "drupal-settings" in h:
+        fam = "drupal"
+    else:
+        fam = "custom"
+    label = {"wordpress": "WordPress", "shopify": "Shopify", "nextjs": "Next.js", "nuxt": "Nuxt (Vue)",
+             "wix": "Wix", "webflow": "Webflow", "squarespace": "Squarespace", "gatsby": "Gatsby",
+             "angular": "Angular", "react": "React (SPA)", "joomla": "Joomla", "drupal": "Drupal",
+             "custom": "Custom / unknown"}[fam]
+    if extras:
+        label += " (" + ", ".join(extras) + ")"
+    return {"family": fam, "label": label, "server": (headers or {}).get("server", "")}
 
 
 # ----------------------------------------------------------------------------- page type
@@ -676,12 +809,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("url")
     ap.add_argument("--out", default="crawl.json")
-    ap.add_argument("--max-pages", type=int, default=200)
+    ap.add_argument("--max-pages", type=int, default=10000)
     ap.add_argument("--single", action="store_true", help="audit one page only")
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--delay", type=float, default=0.2, help="seconds between requests per worker")
     ap.add_argument("--timeout", type=int, default=20)
-    ap.add_argument("--max-minutes", type=float, default=15)
+    ap.add_argument("--max-minutes", type=float, default=35)
     ap.add_argument("--max-images", type=int, default=800)
     ap.add_argument("--check-external", type=int, default=300, help="max external links to status-check (0=off)")
     ap.add_argument("--ignore-robots", action="store_true")
