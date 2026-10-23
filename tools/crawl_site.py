@@ -17,6 +17,7 @@ Usage:
   python3 crawl_site.py https://example.com/page/ --single   # one page + its links/images
 """
 import argparse
+import os
 import ipaddress
 import json
 import re
@@ -526,7 +527,7 @@ class Crawler:
         """Status-check internal link targets + sitemap URLs not crawled (no parsing)."""
         targets = [u for u in list(self.inlinks) + [s["url"] for s in self.sitemap_urls]
                    if u not in self.status and not SKIP_EXT.search(urlparse(u).path)]
-        targets = list(dict.fromkeys(targets))[:1500]
+        targets = list(dict.fromkeys(targets))[:4000]
         with ThreadPoolExecutor(self.workers) as pool:
             for u, rec in zip(targets, pool.map(lambda x: self.fetch(x, want_body=False), targets)):
                 if not self.time_left():
@@ -561,6 +562,48 @@ class Crawler:
             for u, res in zip(exts, pool.map(chk, exts)):
                 self.external[u] = res
 
+    def pagespeed(self, key, limit=6):
+        """Lab + field Core Web Vitals (mobile) for the start URL + one page per page type."""
+        picks, seen = [self.start], {"Homepage"}
+        for p in self.pages.values():
+            if p["page_type"] not in seen and len(picks) < limit:
+                seen.add(p["page_type"]); picks.append(p["url"])
+        picks = list(dict.fromkeys(picks))[:limit]
+        def run(u):
+            api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+            try:
+                r = requests.get(api, params={"url": u, "strategy": "mobile", "category": "performance", "key": key},
+                                 timeout=120)
+                if r.status_code != 200:
+                    return {"url": u, "error": f"PSI HTTP {r.status_code}: {r.text[:120]}"}
+                d = r.json()
+                lh = d.get("lighthouseResult", {})
+                au = lh.get("audits", {})
+                num = lambda k: au.get(k, {}).get("numericValue")
+                def field(src):
+                    m = (d.get(src) or {}).get("metrics") or {}
+                    g = lambda k: (m.get(k) or {})
+                    return {"lcp_ms": g("LARGEST_CONTENTFUL_PAINT_MS").get("percentile"),
+                            "lcp_cat": g("LARGEST_CONTENTFUL_PAINT_MS").get("category"),
+                            "inp_ms": g("INTERACTION_TO_NEXT_PAINT").get("percentile"),
+                            "inp_cat": g("INTERACTION_TO_NEXT_PAINT").get("category"),
+                            "cls": (g("CUMULATIVE_LAYOUT_SHIFT_SCORE").get("percentile") or 0) / 100
+                            if g("CUMULATIVE_LAYOUT_SHIFT_SCORE") else None,
+                            "cls_cat": g("CUMULATIVE_LAYOUT_SHIFT_SCORE").get("category"),
+                            "overall": (d.get(src) or {}).get("overall_category")}
+                opps = sorted(((a.get("details") or {}).get("overallSavingsMs") or 0, a.get("title"))
+                              for a in au.values() if (a.get("details") or {}).get("type") == "opportunity")
+                return {"url": u, "error": None,
+                        "perf_score": round((lh.get("categories", {}).get("performance", {}).get("score") or 0) * 100),
+                        "lab_lcp_ms": num("largest-contentful-paint"), "lab_cls": num("cumulative-layout-shift"),
+                        "lab_tbt_ms": num("total-blocking-time"), "lab_fcp_ms": num("first-contentful-paint"),
+                        "field_url": field("loadingExperience"), "field_origin": field("originLoadingExperience"),
+                        "top_opportunities": [f"{t} (~{int(ms)} ms)" for ms, t in reversed(opps[-4:]) if ms]}
+            except Exception as e:  # noqa: BLE001
+                return {"url": u, "error": str(e)[:160]}
+        with ThreadPoolExecutor(3) as pool:
+            return list(pool.map(run, picks))
+
     def result(self):
         return {
             "meta": {"start_url": self.start, "domain": self.root_host, "crawled_at": now_iso(),
@@ -571,6 +614,7 @@ class Crawler:
                      "notes": self.notes, "user_agent": UA},
             "site_checks": self.site_checks,
             "robots_txt": self.robots_txt,
+            "pagespeed": getattr(self, "psi", []),
             "sitemaps": self.sitemaps,
             "sitemap_urls": self.sitemap_urls,
             "pages": list(self.pages.values()),
@@ -641,12 +685,18 @@ def main():
     ap.add_argument("--max-images", type=int, default=800)
     ap.add_argument("--check-external", type=int, default=300, help="max external links to status-check (0=off)")
     ap.add_argument("--ignore-robots", action="store_true")
+    ap.add_argument("--no-psi", action="store_true", help="skip PageSpeed Insights")
     ap.add_argument("--allow-private", action="store_true", help="testing only: allow localhost targets")
     a = ap.parse_args()
     c = Crawler(a.url, a.max_pages, a.single, a.allow_private, a.delay, a.workers, a.max_minutes,
                 a.check_external, a.max_images, not a.ignore_robots, a.timeout)
     t0 = time.time()
     c.crawl()
+    key = os.environ.get("PAGESPEED_API_KEY", "").strip()
+    if key and not a.no_psi:
+        c.psi = c.pagespeed(key)
+    elif not a.no_psi:
+        c.notes.append("Core Web Vitals not measured: set PAGESPEED_API_KEY (free Google API key).")
     res = c.result()
     res["meta"]["duration_sec"] = int(time.time() - t0)
     with open(a.out, "w", encoding="utf-8") as f:
