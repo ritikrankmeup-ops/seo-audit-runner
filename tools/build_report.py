@@ -44,7 +44,14 @@ LOCAL_TYPES = {"localbusiness", "dentist", "medicalclinic", "medicalbusiness", "
                "restaurant", "professionalservice", "homeandconstructionbusiness", "legalservice",
                "automotivebusiness", "healthandbeautybusiness", "hairsalon", "beautysalon",
                "dayspa", "medicalorganization", "hospital", "lodgingbusiness", "hotel",
-               "realestateagent", "financialservice", "accountingservice", "educationalorganization"}
+               "realestateagent", "financialservice", "accountingservice", "emergencyservice",
+               "autorepair", "plumber", "electrician", "generalcontractor", "lawyer", "attorney", "optician"}
+# Any of these satisfies "Organization" (schema.org subtypes of Organization, incl. every LocalBusiness)
+ORG_TYPES = {"organization", "corporation", "medicalorganization", "educationalorganization",
+             "collegeoruniversity", "school", "highschool", "middleschool", "elementaryschool", "preschool",
+             "ngo", "onlinestore", "onlinebusiness", "newsmediaorganization", "sportsorganization",
+             "governmentorganization", "researchorganization", "airline", "library",
+             "performinggroup", "consortium"} | LOCAL_TYPES
 SOCIAL = ("facebook.com", "instagram.com", "linkedin.com", "twitter.com", "x.com", "youtube.com",
           "pinterest.com", "tiktok.com", "wa.me", "whatsapp.com", "threads.net")
 
@@ -95,6 +102,13 @@ class Audit:
     def technical(self):
         sc = self.c.get("site_checks", {})
         start = self.c["meta"]["start_url"]
+        if not self.pages:
+            st = self.status.get(start, {})
+            self.add("Technical", "Crawl", "Start URL could not be crawled - report is incomplete", "Critical", [start],
+                     "Nothing else in this workbook is reliable until the page can be fetched.",
+                     "Check the site is online. If it blocks bots/cloud servers (403/429/444), whitelist the audit "
+                     "or run Screaming Frog from the office and use its export.", "SEO",
+                     evidence=f"Status: {st.get('final_status') or st.get('status')} | Error: {st.get('error')}")
         redirects = [s for s in self.status.values() if s.get("chain")]
         chains = [s for s in redirects if len(s["chain"]) > 1]
         errors = [s for s in self.status.values()
@@ -397,8 +411,7 @@ class Audit:
             self.add("Schema", "Coverage", "Schema type expected for this page type is missing", "Medium", missing_exp,
                      "Each page type has a schema that unlocks rich results (Product, Article, LocalBusiness, Breadcrumb).",
                      "See 'Schema - Per Page' column 'Missing' for exactly which type to add.", "Developer")
-        org_pages = [p for p in P if any(t.lower() in ("organization", "corporation", "medicalorganization")
-                                         for t in page_types(p))]
+        org_pages = [p for p in P if {t.lower() for t in page_types(p)} & ORG_TYPES]
         home = next((p for p in P if p["page_type"] == "Homepage"), None)
         if not org_pages:
             self.add("Schema", "Organization", "No Organization schema found", "High",
@@ -409,8 +422,9 @@ class Audit:
             names = set()
             for p in org_pages:
                 for n in p["schema"]:
-                    if any(t.lower() in ("organization", "corporation", "medicalorganization") for t in types_of(n)):
+                    if {t.lower() for t in types_of(n)} & (ORG_TYPES - LOCAL_TYPES):
                         names.add(str(n.get("name", "")).strip())
+            names.discard("")
             if len(names) > 1:
                 self.add("Schema", "Organization", "Organization name differs across pages / multiple entities",
                          "Medium", [p["url"] for p in org_pages],
@@ -424,12 +438,15 @@ class Audit:
                 for n in p["schema"]:
                     if {t.lower() for t in types_of(n)} & LOCAL_TYPES and n.get("telephone"):
                         phones.add(digits(str(n["telephone"])))
-            rated = [p["url"] for p in local for n in p["schema"] if n.get("aggregateRating") or n.get("review")]
-            if rated:
-                self.add("Schema", "LocalBusiness", "Self-serving review/rating markup on LocalBusiness", "High",
-                         sorted(set(rated)),
-                         "Google ignores self-served LocalBusiness reviews and can apply a manual action if they are not genuine.",
-                         "Remove aggregateRating/review from LocalBusiness unless reviews are collected on-site and visible.", "Developer")
+        rated = [p["url"] for p in P for n in p.get("schema", [])
+                 if ({t.lower() for t in types_of(n)} & ORG_TYPES) and (n.get("aggregateRating") or n.get("review"))]
+        if rated:
+            self.add("Schema", "Reviews", "Review/rating markup on the business's own Organization/LocalBusiness", "Medium",
+                     sorted(set(rated)),
+                     "Google does not show review stars for self-serving reviews on an Organization/LocalBusiness; "
+                     "if the ratings are not real, visible reviews on the page, it breaks Google's structured-data guidelines.",
+                     "Remove aggregateRating/review from the Organization/LocalBusiness node, or move genuine ratings to "
+                     "Course/Product/Service items that show the reviews on the page.", "Developer")
 
     # ---- off-page signals visible from the site
     def offpage(self):
@@ -459,8 +476,34 @@ class Audit:
                      "Use one phone format everywhere and match the GBP listing.", "SEO",
                      evidence=f"tel: links {sorted(tels)} vs schema {sorted(schema_tels)}")
 
+    def cwv(self):
+        psi = self.c.get("pagespeed") or []
+        ok = [x for x in psi if not x.get("error")]
+        if not ok:
+            self.add("Technical", "Core Web Vitals", "Core Web Vitals not measured", "Info", [],
+                     "Speed is a ranking factor and affects conversions.",
+                     "Add a free Google API key as PAGESPEED_API_KEY in the cloud environment, then re-run.", "Developer",
+                     evidence="; ".join(x.get("error", "") for x in psi)[:200] or "No PageSpeed key configured")
+            return
+        poor_lab = [x["url"] for x in ok if x.get("perf_score", 100) < 50]
+        if poor_lab:
+            self.add("Technical", "Core Web Vitals", "Poor mobile performance score (<50)", "High", poor_lab,
+                     "Slow mobile pages lose rankings and visitors.",
+                     "Fix the top opportunities in 'Tech - Core Web Vitals' (images, render-blocking CSS/JS, caching).", "Developer")
+        for metric, label, limit in (("lcp", "LCP", 2500), ("inp", "INP", 200)):
+            bad = [x["url"] for x in ok if (x.get("field_url") or {}).get(f"{metric}_cat") in ("SLOW", "AVERAGE")]
+            if bad:
+                self.add("Technical", "Core Web Vitals", f"Real-user {label} not 'Good' (target < {limit} ms)", "High", bad,
+                         "Google uses real-user Core Web Vitals (CrUX) as a ranking signal.",
+                         "See 'Tech - Core Web Vitals' for the measured value and top fixes.", "Developer")
+        bad_cls = [x["url"] for x in ok if (x.get("field_url") or {}).get("cls_cat") in ("SLOW", "AVERAGE")]
+        if bad_cls:
+            self.add("Technical", "Core Web Vitals", "Real-user CLS not 'Good' (target < 0.1)", "Medium", bad_cls,
+                     "Layout shifts frustrate users.", "Set image/embed dimensions; reserve space for banners/fonts.", "Developer")
+
     def run(self):
         self.technical()
+        self.cwv()
         self.onpage()
         self.schema()
         self.offpage()
@@ -625,6 +668,22 @@ def build_tables(au):
     T["Tech - Sitemap URLs"] = (["URL", "First status", "Final URL", "Final status", "Sitemap file(s)", "Times listed",
                                  "Result"], rows, [60, 9, 55, 9, 45, 8, 12])
 
+    # Core Web Vitals
+    rows = []
+    for x in c.get("pagespeed") or []:
+        f, o = x.get("field_url") or {}, x.get("field_origin") or {}
+        fmt = lambda v, cat: f"{v} ({cat})" if v is not None else "no field data"
+        rows.append([x["url"], x.get("perf_score", "") if not x.get("error") else x["error"],
+                     round(x["lab_lcp_ms"]) if x.get("lab_lcp_ms") else "", round(x["lab_tbt_ms"]) if x.get("lab_tbt_ms") else "",
+                     round(x["lab_cls"], 3) if x.get("lab_cls") is not None else "",
+                     fmt(f.get("lcp_ms"), f.get("lcp_cat")), fmt(f.get("inp_ms"), f.get("inp_cat")),
+                     fmt(f.get("cls"), f.get("cls_cat")), f"{o.get('overall') or 'n/a'} (LCP {o.get('lcp_ms')} / INP {o.get('inp_ms')})",
+                     "\n".join(x.get("top_opportunities") or [])])
+    T["Tech - Core Web Vitals"] = (["URL", "Mobile perf score (lab)", "Lab LCP ms", "Lab TBT ms", "Lab CLS",
+                                    "Real-user LCP (p75)", "Real-user INP (p75)", "Real-user CLS (p75)",
+                                    "Whole-site real-user", "Top fixes (est. saving)"],
+                                   rows, [50, 12, 10, 10, 8, 18, 18, 18, 30, 60])
+
     # Titles & meta
     tcount = Counter((p.get("title") or "").strip().lower() for p in P if p.get("title"))
     mcount = Counter((p.get("meta_description") or "").strip().lower() for p in P if p.get("meta_description"))
@@ -753,12 +812,14 @@ def build_tables(au):
     for p in P:
         for n in p["schema"]:
             tl = {t.lower() for t in types_of(n)}
-            if tl & {"organization", "corporation", "medicalorganization", "onlinestore"}:
+            if tl & (ORG_TYPES - LOCAL_TYPES):
                 org_nodes.append((p["url"], n))
             if tl & LOCAL_TYPES:
                 loc_nodes.append((p["url"], n))
     org_req = [("name", True), ("url", True), ("logo", True), ("sameAs", False), ("contactPoint", False),
                ("@id", False), ("address", False)]
+    if not org_nodes and loc_nodes:
+        org_nodes = loc_nodes  # LocalBusiness is an Organization subtype
     if org_nodes:
         u, n = org_nodes[0]
         rows.append(["Organization", "Present", "Pass", f"Found on {len({x[0] for x in org_nodes})} of {len(P)} pages", ""])
@@ -954,7 +1015,7 @@ def write_xlsx(au, T, path):
 
     # ---------- data sheets
     order = ["Issue Tracker", "Page Inventory", "Page Types", "Tech - Redirects", "Tech - URL Errors",
-             "Tech - Indexability", "Tech - Sitemap URLs", "Tech - Site Checks", "OnPage - Titles & Meta",
+             "Tech - Indexability", "Tech - Sitemap URLs", "Tech - Site Checks", "Tech - Core Web Vitals", "OnPage - Titles & Meta",
              "OnPage - Headings", "OnPage - Header-Footer H", "OnPage - Images", "Schema - Per Page",
              "Schema - Org & Local", "OffPage - Links & Profiles", "Action Plan", "Data Sources"]
     tab_color = {"Tech": "2F5597", "OnPage": "548235", "Schema": "7030A0", "OffPage": "C55A11",
@@ -1028,7 +1089,8 @@ def summary(au):
            "page_types": dict(types),
            "crawler_issues": [{"severity": i["severity"], "area": i["area"], "issue": i["issue"], "count": i["count"],
                                "examples": i["urls"][:3], "evidence": i["evidence"]} for i in au.issues],
-           "representative_pages": {t: next(p["url"] for p in au.pages if p["page_type"] == t) for t in types}}
+           "representative_pages": {t: [p["url"] for p in au.pages if p["page_type"] == t][:3] for t in types},
+           "pagespeed": [{k: x.get(k) for k in ("url", "perf_score", "error", "top_opportunities")} for x in au.c.get("pagespeed") or []]}
     return out
 
 
