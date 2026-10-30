@@ -17,6 +17,7 @@ Usage:
   python3 crawl_site.py https://example.com/page/ --single   # one page + its links/images
 """
 import argparse
+import hashlib
 import gzip
 import os
 import ipaddress
@@ -211,6 +212,10 @@ class Crawler:
                 raise
             except requests.exceptions.RequestException as e:
                 last = e
+                msg = str(e).lower()
+                if any(k in msg for k in ("name or service not known", "failed to resolve", "nodename nor servname",
+                                          "connection refused", "no address associated", "getaddrinfo failed")):
+                    break  # host/port does not exist - retrying will not help
                 self._throttle()
                 time.sleep((2, 5, 10, 10)[attempt])          # back off: 2s, 5s, 10s
                 continue
@@ -408,6 +413,17 @@ class Crawler:
                              "error": rec["error"]}
         nf = self.fetch(f"{p.scheme}://{host}/this-page-should-not-exist-seo-audit-404-check/", want_body=False)
         checks["soft_404_test"] = {"status": nf["final_status"] or nf["status"], "error": nf["error"]}
+        # URL versions that should all 301 to ONE canonical version
+        variants = [("http + same host", f"http://{host}/"), ("http + other host (www/non-www)", f"http://{alt_host}/"),
+                    ("https + other host (www/non-www)", f"https://{alt_host}/"),
+                    ("/index.html", f"{p.scheme}://{host}/index.html"), ("/index.php", f"{p.scheme}://{host}/index.php"),
+                    ("Uppercase path", f"{p.scheme}://{host}/" + (p.path.strip("/").upper() + "/" if p.path.strip("/") else "INDEX"))]
+        out = []
+        for label, u in variants:
+            rec = self.fetch(u, want_body=False)
+            out.append({"version": label, "url": u, "status": rec["status"], "final_url": rec["final_url"],
+                        "final_status": rec["final_status"], "hops": len(rec["chain"]), "error": rec["error"]})
+        checks["url_versions"] = out
         self.site_checks.update(checks)
 
     # -- page parsing
@@ -447,6 +463,7 @@ class Crawler:
             if not src:
                 continue
             imgs.append({"src": src, "alt": img.get("alt"), "has_alt_attr": img.has_attr("alt"),
+                         "srcset": bool(img.get("srcset") or img.get("data-srcset")),
                          "width": img.get("width"), "height": img.get("height"),
                          "loading": img.get("loading"), "region": region_of(img)})
 
@@ -512,6 +529,10 @@ class Crawler:
             "hreflang": hreflang, "headings": headings, "images": imgs, "links": links,
             "schema": schema_nodes, "schema_errors": schema_errors, "microdata": [m for m in microdata if m],
             "word_count": len(main_text.split()), "body_classes": body_classes,
+            "content_hash": hashlib.md5(main_text.lower().encode()).hexdigest() if len(main_text.split()) >= 40 else None,
+            "snippet": main_text[:400],
+            "faq_like": sum(1 for h in headings if h["text"].endswith("?")) >= 3 or
+                        any("faq" in h["text"].lower() or "frequently asked" in h["text"].lower() for h in headings),
             "tel_links": tel_links, "mixed_content": mixed[:20],
             "has_form": bool(soup.find("form")),
             "add_to_cart": bool(re.search(r"add[ _-]?to[ _-]?cart|single_add_to_cart|buy now",
@@ -583,6 +604,8 @@ class Crawler:
                               f"{len(queue)} more URLs were discovered but not crawled.")
         self.status_check_remaining()
         self.retry_unreachable()
+        if not self.single:
+            self.slash_check()
         self.check_images()
         self.check_externals()
 
@@ -597,6 +620,18 @@ class Crawler:
                     break
                 rec.pop("body", None)
                 self.status[u] = rec
+
+    def slash_check(self):
+        """Does an inner page also load with/without the trailing slash (duplicate version)?"""
+        inner = next((u for u in self.pages if urlparse(u).path.strip("/")), None)
+        if not inner:
+            return
+        alt = inner[:-1] if inner.endswith("/") else inner + "/"
+        rec = self.fetch(alt, want_body=False)
+        self.site_checks.setdefault("url_versions", []).append(
+            {"version": "Trailing slash toggled (inner page)", "url": alt, "status": rec["status"],
+             "final_url": rec["final_url"], "final_status": rec["final_status"], "hops": len(rec["chain"]),
+             "error": rec["error"], "canonical_target": inner})
 
     def retry_unreachable(self):
         """Second, slow, single-threaded pass over URLs that gave no response, so server overload
@@ -645,20 +680,30 @@ class Crawler:
             for u, res in zip(exts, pool.map(chk, exts)):
                 self.external[u] = res
 
-    def pagespeed(self, key, limit=6):
-        """Lab + field Core Web Vitals (mobile) for the start URL + one page per page type."""
+    def pagespeed(self, key, limit=4):
+        """Lab + field Core Web Vitals on MOBILE and DESKTOP for the start URL + one page per main page type."""
         picks, seen = [self.start], {"Homepage"}
         for p in self.pages.values():
             if p["page_type"] not in seen and len(picks) < limit:
                 seen.add(p["page_type"]); picks.append(p["url"])
         picks = list(dict.fromkeys(picks))[:limit]
-        def run(u):
+        jobs = [(u, dev) for u in picks for dev in ("mobile", "desktop")]
+        def run(job):
+            u, dev = job
             api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+            params = [("url", u), ("strategy", dev), ("category", "performance"), ("category", "seo"),
+                      ("category", "best-practices")]
+            if key:
+                params.append(("key", key))
             try:
-                r = requests.get(api, params={"url": u, "strategy": "mobile", "category": "performance", "key": key},
-                                 timeout=120)
+                r = None
+                for attempt in range(3):
+                    r = requests.get(api, params=params, timeout=150)
+                    if r.status_code != 429:
+                        break
+                    time.sleep(20 * (attempt + 1))
                 if r.status_code != 200:
-                    return {"url": u, "error": f"PSI HTTP {r.status_code}: {r.text[:120]}"}
+                    return {"url": u, "device": dev, "error": f"PSI HTTP {r.status_code}: {r.text[:120]}"}
                 d = r.json()
                 lh = d.get("lighthouseResult", {})
                 au = lh.get("audits", {})
@@ -676,16 +721,23 @@ class Crawler:
                             "overall": (d.get(src) or {}).get("overall_category")}
                 opps = sorted(((a.get("details") or {}).get("overallSavingsMs") or 0, a.get("title"))
                               for a in au.values() if (a.get("details") or {}).get("type") == "opportunity")
-                return {"url": u, "error": None,
+                mobile_audits = {k: {"title": au[k].get("title"), "score": au[k].get("score"),
+                                     "display": au[k].get("displayValue", "")}
+                                 for k in ("viewport", "font-size", "tap-targets", "content-width",
+                                           "uses-responsive-images", "image-aspect-ratio") if k in au}
+                return {"url": u, "device": dev, "error": None,
                         "perf_score": round((lh.get("categories", {}).get("performance", {}).get("score") or 0) * 100),
+                        "seo_score": round((lh.get("categories", {}).get("seo", {}).get("score") or 0) * 100),
                         "lab_lcp_ms": num("largest-contentful-paint"), "lab_cls": num("cumulative-layout-shift"),
                         "lab_tbt_ms": num("total-blocking-time"), "lab_fcp_ms": num("first-contentful-paint"),
+                        "lab_si_ms": num("speed-index"), "ttfb_ms": num("server-response-time"),
+                        "mobile_audits": mobile_audits,
                         "field_url": field("loadingExperience"), "field_origin": field("originLoadingExperience"),
                         "top_opportunities": [f"{t} (~{int(ms)} ms)" for ms, t in reversed(opps[-4:]) if ms]}
             except Exception as e:  # noqa: BLE001
-                return {"url": u, "error": str(e)[:160]}
-        with ThreadPoolExecutor(3) as pool:
-            return list(pool.map(run, picks))
+                return {"url": u, "device": dev, "error": str(e)[:160]}
+        with ThreadPoolExecutor(2 if key else 1) as pool:
+            return list(pool.map(run, jobs))
 
     def result(self):
         return {
@@ -785,6 +837,8 @@ def classify(page):
     if re.search(r"/(product-category|collections?|shop|category/products?)(/|$)", path) or \
             "tax-product_cat" in bc or "woocommerce-shop" in bc:
         return "Product category / shop"
+    if "course" in types or re.search(r"/(courses?|programs?|training|certification)/[^/]+", path):
+        return "Course page"
     if {"blogposting", "article", "newsarticle"} & types or "single-post" in bc or \
             re.search(r"/(blog|news|articles?|insights?|resources)/.+", path):
         return "Blog post / article"
@@ -826,10 +880,11 @@ def main():
     t0 = time.time()
     c.crawl()
     key = os.environ.get("PAGESPEED_API_KEY", "").strip()
-    if key and not a.no_psi:
-        c.psi = c.pagespeed(key)
-    elif not a.no_psi:
-        c.notes.append("Core Web Vitals not measured: set PAGESPEED_API_KEY (free Google API key).")
+    if not a.no_psi:
+        # with a key: home + 3 page types on mobile AND desktop; without: homepage only (Google rate-limits keyless use)
+        c.psi = c.pagespeed(key or None, limit=4 if key else 1)
+        if not key:
+            c.notes.append("PageSpeed ran without an API key (homepage only). Set PAGESPEED_API_KEY for more pages.")
     res = c.result()
     res["meta"]["duration_sec"] = int(time.time() - t0)
     with open(a.out, "w", encoding="utf-8") as f:
